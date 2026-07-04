@@ -6,6 +6,7 @@ const HELIUS_KEY = process.env.HELIUS_API_KEY;
 
 const FLUSH_INTERVAL_MS = 5000;
 const DRAIN_TIMEOUT_MS = 60000;
+const PROGRESS_INTERVAL_MS = 15 * 60 * 1000;
 
 const DEX_ACCOUNTS = [
   'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
@@ -21,6 +22,10 @@ export function startWalletDiscovery(onCollectComplete, collectDurationMs = 3600
   let stopping = false;
   let flushing = false;
   const pendingCounts = new Map();
+  // pendingCounts est vidée à chaque flush : ce Set garde le cumul des
+  // wallets uniques vus depuis le début, sans requête DB.
+  const seenWallets = new Set();
+  const startedAt = Date.now();
 
   async function flush() {
     if (flushing || pendingCounts.size === 0) return;
@@ -69,6 +74,14 @@ export function startWalletDiscovery(onCollectComplete, collectDurationMs = 3600
 
   const flushTimer = setInterval(flush, FLUSH_INTERVAL_MS);
 
+  const progressTimer = setInterval(() => {
+    const elapsedMin = Math.round((Date.now() - startedAt) / 60000);
+    console.log(
+      `\n📊 Progression : ${elapsedMin} min écoulées — ` +
+      `${seenWallets.size} wallets uniques vus (${count} swaps)`
+    );
+  }, PROGRESS_INTERVAL_MS);
+
   ws.on('open', () => {
     console.log('✅ WebSocket connecté — collecte en cours...');
     ws.send(JSON.stringify({
@@ -102,6 +115,7 @@ export function startWalletDiscovery(onCollectComplete, collectDurationMs = 3600
         count++;
         process.stdout.write(`\r📡 ${count} swaps détectés...`);
         pendingCounts.set(signer, (pendingCounts.get(signer) ?? 0) + 1);
+        seenWallets.add(signer);
       }
     } catch {
       // ignore malformed messages
@@ -115,6 +129,7 @@ export function startWalletDiscovery(onCollectComplete, collectDurationMs = 3600
   ws.on('close', async () => {
     clearTimeout(timer);
     clearInterval(flushTimer);
+    clearInterval(progressTimer);
     stopping = true;
     await finalFlush();
     console.log(`🔌 WebSocket fermé — ${count} swaps détectés au total.`);
