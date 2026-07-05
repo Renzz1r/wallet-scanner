@@ -12,7 +12,7 @@ import {
   closeDatabase,
 } from './database.js';
 
-const COLLECT_DURATION_MS = 6 * 60 * 60 * 1000;
+const COLLECT_DURATION_MS = 1 * 60 * 60 * 1000;
 const MIN_APPEARANCES = 20;
 
 async function processResults() {

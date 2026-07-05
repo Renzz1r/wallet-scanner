@@ -283,7 +283,7 @@ export async function scoreWallet(walletAddress) {
   const solPrice = await getSolPrice();
 
   const hoursBack = 48;
-  const transactions = await getWalletTransactions(walletAddress, hoursBack, 5);
+  const transactions = await getWalletTransactions(walletAddress, hoursBack, 3);
   if (transactions.length < 5) return reject('moins de 5 transactions');
 
   const trades = transactions
