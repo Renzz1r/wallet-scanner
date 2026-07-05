@@ -104,33 +104,134 @@ function groupByToken(trades) {
   return map;
 }
 
+// --- Filtre de reproductibilité économique (copy trading) -------------------
+// Un achat n'est copiable que si le token avait une market cap suffisante au
+// moment du trade (sinon slippage prohibitif pour notre taille d'ordre) et si
+// le wallet ne détient pas une part significative de la supply (sa sortie
+// serait elle-même le problème de liquidité).
+export const MIN_MCAP_USD = 25_000;
+export const MAX_SUPPLY_SHARE = 0.01;
+// Au-delà de cette proportion de positions non copiables, le wallet entier est
+// rejeté : son edge vit dans la zone non reproductible.
+const MAX_MICROCAP_RATIO = 0.40;
+
+// Supply brute (plus petites unités) par mint. Fixe pour l'immense majorité
+// des memecoins (mint authority révoquée) → cache sans expiration.
+const supplyCache = new Map();
+
+async function getTokenSupplyRaw(mint) {
+  if (supplyCache.has(mint)) return supplyCache.get(mint);
+  try {
+    const { data } = await axios.post(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`,
+      { jsonrpc: '2.0', id: 1, method: 'getTokenSupply', params: [mint] }
+    );
+    const supply = parseFloat(data?.result?.value?.amount) || 0;
+    if (supply > 0) supplyCache.set(mint, supply);
+    return supply;
+  } catch {
+    // Supply inconnue : reproductibilité invérifiable → non copiable.
+    return 0;
+  }
+}
+
+// Réutilisable tel quel par le module d'exécution du copy trade : évalue un
+// achat observé (montants du swap) à l'instant où il se produit.
+// - buySol / buyTokens : montants du swap de référence — le prix qui en
+//   découle est le prix d'exécution réel, slippage inclus.
+// - walletTokensTotal : cumul de tokens achetés par le wallet sur ce mint.
+// Les montants token sont en unités brutes : les décimales s'annulent entre
+// le prix par unité brute et la supply brute.
+export async function assessCopyability(tokenMint, buySol, buyTokens, walletTokensTotal = buyTokens) {
+  if (buySol <= 0 || buyTokens <= 0) return { copyable: false, reason: 'montants invalides' };
+  const supplyRaw = await getTokenSupplyRaw(tokenMint);
+  if (supplyRaw <= 0) return { copyable: false, reason: 'supply inconnue' };
+  const solPrice = await getSolPrice();
+  const mcapUsd = (buySol / buyTokens) * supplyRaw * solPrice;
+  const supplyShare = walletTokensTotal / supplyRaw;
+  if (mcapUsd < MIN_MCAP_USD) return { copyable: false, reason: 'mcap trop faible', mcapUsd, supplyShare };
+  if (supplyShare > MAX_SUPPLY_SHARE) return { copyable: false, reason: 'part de supply trop élevée', mcapUsd, supplyShare };
+  return { copyable: true, mcapUsd, supplyShare };
+}
+
+// Retire les trades des mints non copiables (mcap au premier achat de la
+// fenêtre, part de supply cumulée). Retourne null si la proportion de
+// positions non copiables dépasse MAX_MICROCAP_RATIO.
+async function filterCopyableTrades(trades) {
+  const buysByMint = new Map();
+  for (const t of trades) {
+    if (t.side !== 'buy') continue;
+    const cur = buysByMint.get(t.tokenMint);
+    if (!cur) buysByMint.set(t.tokenMint, { first: t, total: t.amountToken });
+    else {
+      cur.total += t.amountToken;
+      if (t.timestamp < cur.first.timestamp) cur.first = t;
+    }
+  }
+  if (buysByMint.size === 0) return { trades, excluded: 0, assessed: 0 };
+
+  const limit = pLimit(5);
+  const excludedMints = new Set();
+  await Promise.all([...buysByMint].map(([mint, { first, total }]) =>
+    limit(async () => {
+      const res = await assessCopyability(mint, first.amountSol, first.amountToken, total);
+      if (!res.copyable) excludedMints.add(mint);
+    })
+  ));
+
+  if (excludedMints.size / buysByMint.size > MAX_MICROCAP_RATIO) return null;
+  return {
+    trades: trades.filter(t => !excludedMints.has(t.tokenMint)),
+    excluded: excludedMints.size,
+    assessed: buysByMint.size,
+  };
+}
+
 function calculateSortino(trades) {
   const tokenMap = groupByToken(trades);
-  const rois = [];
+  const positions = [];
   for (const pos of tokenMap.values()) {
     // Seules les positions fermées (achat ET vente) ont un ROI réalisé.
     if (pos.bought === 0 || pos.sold === 0) continue;
-    rois.push((pos.sold - pos.bought) / pos.bought);
+    positions.push({ roi: (pos.sold - pos.bought) / pos.bought, weight: pos.bought });
   }
-  if (rois.length === 0) return 0;
+  if (positions.length === 0) return 0;
 
-  const losingROIs = rois.filter(r => r <= 0);
-  const meanAll = rois.reduce((a, b) => a + b, 0) / rois.length;
+  const totalWeight = positions.reduce((sum, p) => sum + p.weight, 0);
+  // Σ roi·bought = Σ (sold - bought) : PnL SOL réalisé des positions fermées.
+  const realizedPnl = positions.reduce((sum, p) => sum + p.roi * p.weight, 0);
+  const losingCount = positions.filter(p => p.roi <= 0).length;
 
   // Moins de 3 pertes observées : échantillon insuffisant pour mesurer le
   // risque → pénalité de confiance (0 perte ×0.25, 1 ×0.5, 2 ×0.75, ≥3 ×1)
   // au lieu d'un 10 automatique.
-  const lossConfidence = Math.min(1, (losingROIs.length + 1) / 4);
+  const lossConfidence = Math.min(1, (losingCount + 1) / 4);
 
-  if (losingROIs.length === 0) return meanAll > 0 ? 10 * lossConfidence : 0;
-
-  const meanLosing = losingROIs.reduce((a, b) => a + b, 0) / losingROIs.length;
+  // Moyenne des ROI pondérée par le capital engagé : une grosse position
+  // perdante ne peut plus être noyée par des petits gains en %.
+  const weightedMean = realizedPnl / totalWeight;
+  // Downside deviation standard (cible 0, N = toutes les positions fermées) :
+  // mesure l'amplitude des pertes, pas leur dispersion entre elles — des
+  // rugs réguliers restent comptés comme du risque.
   const downside = Math.sqrt(
-    losingROIs.reduce((acc, r) => acc + (r - meanLosing) ** 2, 0) / losingROIs.length
+    positions.reduce((sum, p) => sum + Math.min(p.roi, 0) ** 2 * p.weight, 0) / totalWeight
   );
 
-  if (downside === 0) return meanAll > 0 ? 10 * lossConfidence : 0;
-  return Math.min(10, Math.max(0, (meanAll / downside) * 5)) * lossConfidence;
+  let score;
+  if (downside === 0) {
+    score = weightedMean > 0 ? 10 * lossConfidence : 0;
+  } else {
+    // 10·tanh(ratio/2) : même pente (×5) que l'ancien scaling linéaire près
+    // de 0, mais compression asymptotique vers 10 au lieu d'un cap dur
+    // (≈9.95 atteint vers ratio 6 au lieu d'un plafond exact dès ratio 2).
+    score = Math.max(0, 10 * Math.tanh(weightedMean / downside / 2)) * lossConfidence;
+  }
+
+  // Garde-fou économique : un wallet dont le PnL réalisé (positions fermées,
+  // même périmètre que le ratio) est ≤ 0 ne peut pas afficher un bon Sortino.
+  if (realizedPnl <= 0) score = Math.min(score, 2);
+
+  return score;
 }
 
 function calculateProfitFactor(trades) {
@@ -286,11 +387,18 @@ export async function scoreWallet(walletAddress) {
   const transactions = await getWalletTransactions(walletAddress, hoursBack, 3);
   if (transactions.length < 5) return reject('moins de 5 transactions');
 
-  const trades = transactions
+  let trades = transactions
     .filter(tx => isWalletSwap(tx, walletAddress))
     .flatMap(tx => extractSwapData(tx, walletAddress));
 
   if (trades.length < 5) return reject('moins de 5 swaps extraits');
+
+  // Filtre de reproductibilité : seules les positions copiables sont scorées,
+  // et les filtres d'entrée suivants s'appliquent à l'ensemble filtré.
+  const copyFilter = await filterCopyableTrades(trades);
+  if (copyFilter === null) return reject('plus de 40% de positions non copiables (mcap/supply)');
+  trades = copyFilter.trades;
+  if (trades.length < 5) return reject('moins de 5 swaps copiables après filtre mcap');
 
   const tokenMap = groupByToken(trades);
   let winningTokens = 0, losingTokensSold = 0, openPositions = 0, totalPnlSol = 0;

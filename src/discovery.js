@@ -8,10 +8,15 @@ const FLUSH_INTERVAL_MS = 5000;
 const DRAIN_TIMEOUT_MS = 60000;
 const PROGRESS_INTERVAL_MS = 15 * 60 * 1000;
 
+// Programme bonding curve pump.fun : exclu de l'écoute (trades non
+// reproductibles en copy trading), et droppé si un routeur y passe quand même.
+const PUMP_BONDING_PROGRAM = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
+
 const DEX_ACCOUNTS = [
-  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
-  '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',  // Jupiter v6 (agrégateur)
+  '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM v4
+  'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA',  // PumpSwap (AMM post-migration pump.fun)
+  'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',  // Meteora DLMM
 ];
 
 export function startWalletDiscovery(onCollectComplete, collectDurationMs = 3600000) {
@@ -108,6 +113,14 @@ export function startWalletDiscovery(onCollectComplete, collectDurationMs = 3600
 
       const tx = msg.params.result.transaction;
       const accounts = tx?.transaction?.message?.accountKeys ?? [];
+
+      // Drop silencieux des tx touchant la bonding curve pump.fun (routage
+      // Jupiter inclus) : ces trades ne sont pas copiables.
+      const touchesBondingCurve = accounts.some(
+        a => (typeof a === 'string' ? a : a?.pubkey) === PUMP_BONDING_PROGRAM
+      );
+      if (touchesBondingCurve) return;
+
       const first = accounts[0];
       const signer = typeof first === 'string' ? first : first?.pubkey;
 
