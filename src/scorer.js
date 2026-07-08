@@ -50,6 +50,40 @@ async function getWalletTransactions(walletAddress, hoursBack = 48, maxPages = 5
   return transactions;
 }
 
+// --- Pré-filtre étage 1 ------------------------------------------------
+// Écarte les wallets évidents avant l'Enhanced API (100 crédits/page) :
+// (a) 0 crédit : les apparitions comptées pendant la collecte sont une borne
+//     inférieure des swaps du wallet sur 48h. Le scoring rejette au-delà de
+//     120 trades copiables/48h (trades/jour > 60) ; comme le filtre de
+//     copiabilité peut retirer jusqu'à 40% des positions, on ne coupe ici
+//     qu'à partir de 120/0.6 = 200 apparitions — rejet certain, sans appel.
+// (b) 1 crédit : getSignaturesForAddress (timestamps inclus) élimine les
+//     wallets sans activité suffisante ou à cadence absurde sur 48h.
+export const PREFILTER_MAX_APPEARANCES_48H = 200;
+const PREFILTER_MIN_TXS_48H = 5;
+const PREFILTER_MAX_TXS_48H = 1000;
+
+// Nombre de transactions du wallet sur 48h, via les signatures brutes
+// (1 crédit, jusqu'à 1000 signatures par appel). Retourne null en cas
+// d'erreur RPC : fail-open, le scoring standard tranchera.
+async function countRecentTransactions(walletAddress) {
+  const cutoffTime = Math.floor(Date.now() / 1000) - 48 * 3600;
+  try {
+    const { data } = await axios.post(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_KEY}`,
+      {
+        jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress',
+        params: [walletAddress, { limit: PREFILTER_MAX_TXS_48H }],
+      }
+    );
+    const sigs = data?.result;
+    if (!Array.isArray(sigs)) return null;
+    return sigs.filter(s => (s.blockTime ?? 0) >= cutoffTime).length;
+  } catch {
+    return null;
+  }
+}
+
 function isWalletSwap(tx, walletAddress) {
   if (!tx.accountData) return false;
   const allTokenChanges = tx.accountData.flatMap(a => a.tokenBalanceChanges ?? []);
@@ -381,6 +415,18 @@ function reject(reason) {
 }
 
 export async function scoreWallet(walletAddress) {
+  // Étage 1b (1 crédit) : compte les tx sur 48h via les signatures brutes
+  // avant de déclencher l'Enhanced API à 100 crédits/page.
+  const txs48h = await countRecentTransactions(walletAddress);
+  if (txs48h !== null) {
+    if (txs48h < PREFILTER_MIN_TXS_48H) {
+      return reject('pré-filtre 1 crédit : moins de 5 tx en 48h (signatures)');
+    }
+    if (txs48h >= PREFILTER_MAX_TXS_48H) {
+      return reject(`pré-filtre 1 crédit : cadence absurde (≥${PREFILTER_MAX_TXS_48H} tx en 48h)`);
+    }
+  }
+
   const solPrice = await getSolPrice();
 
   const hoursBack = 48;
@@ -460,15 +506,33 @@ export async function scoreWallet(walletAddress) {
   };
 }
 
-export async function scoreWallets(walletAddresses) {
-  const limit = pLimit(3);
-  const total = walletAddresses.length;
-  let completed = 0;
-  let errors = 0;
+// Accepte les lignes de getActiveWallets ({ address, appearances }) ou de
+// simples adresses (appearances inconnu → étage 1a sauté pour ce wallet).
+export async function scoreWallets(wallets) {
+  const items = wallets.map(w => typeof w === 'string'
+    ? { address: w, appearances: null }
+    : { address: w.address, appearances: w.appearances != null ? Number(w.appearances) : null });
 
   for (const key of Object.keys(rejectionCounts)) delete rejectionCounts[key];
 
-  const promises = walletAddresses.map(address =>
+  // Étage 1a (0 crédit) : tranché ici, avant le throttling — aucun appel réseau.
+  const toScore = items.filter(({ appearances }) => {
+    if (appearances !== null && appearances > PREFILTER_MAX_APPEARANCES_48H) {
+      reject(`pré-filtre 0 crédit : > ${PREFILTER_MAX_APPEARANCES_48H} apparitions en 48h (trades/jour > 60 certain)`);
+      return false;
+    }
+    return true;
+  });
+  if (toScore.length < items.length) {
+    console.log(`Pré-filtre 0 crédit : ${items.length - toScore.length} wallet(s) écarté(s) avant tout appel API.`);
+  }
+
+  const limit = pLimit(3);
+  const total = toScore.length;
+  let completed = 0;
+  let errors = 0;
+
+  const promises = toScore.map(({ address }) =>
     limit(async () => {
       await new Promise(r => setTimeout(r, 300));
       try {
@@ -497,10 +561,116 @@ export async function scoreWallets(walletAddresses) {
     }
   }
 
-  console.log(`Bilan : ${total} reçus = ${valid.length} scorés + ${rejectedTotal} rejetés + ${errors} erreurs`);
-  if (valid.length + rejectedTotal + errors !== total) {
-    console.warn(`⚠️ Incohérence de comptage : ${valid.length} + ${rejectedTotal} + ${errors} ≠ ${total}`);
+  console.log(`Bilan : ${items.length} reçus = ${valid.length} scorés + ${rejectedTotal} rejetés + ${errors} erreurs`);
+  if (valid.length + rejectedTotal + errors !== items.length) {
+    console.warn(`⚠️ Incohérence de comptage : ${valid.length} + ${rejectedTotal} + ${errors} ≠ ${items.length}`);
   }
 
   return valid;
+}
+
+// --- Étage 3 : vérification longue durée des finalistes ---------------------
+// Ne recalcule pas le score 48h : mesure la robustesse sur fenêtre longue pour
+// détecter un bon 48h qui masque un mauvais mois. Réservé aux candidats
+// PREMIUM/BON — coût plafonné à VERIFY_MAX_PAGES × 100 crédits par wallet.
+export const VERIFY_WINDOW_DAYS = 30;
+const VERIFY_MAX_PAGES = 30;
+const VERIFY_MIN_CLOSED_POSITIONS = 5;
+const VERIFY_MIN_COVERED_DAYS = 10;
+const VERIFY_MAX_DRAWDOWN_PCT = 60;
+const VERIFY_MIN_POSITIVE_WEEKS_RATIO = 0.5;
+
+// PnL réalisé par semaine calendaire, rattaché à la date de dernière vente de
+// chaque position fermée (même construction que calculateDrawdown).
+function weeklyPnlStats(trades) {
+  const tokenTrades = new Map();
+  for (const t of trades) {
+    if (!tokenTrades.has(t.tokenMint)) tokenTrades.set(t.tokenMint, []);
+    tokenTrades.get(t.tokenMint).push(t);
+  }
+
+  const weeks = new Map();
+  let closedCount = 0;
+  for (const list of tokenTrades.values()) {
+    let bought = 0, sold = 0, lastSell = 0;
+    for (const t of list) {
+      if (t.side === 'buy') bought += t.amountSol;
+      else { sold += t.amountSol; lastSell = Math.max(lastSell, t.timestamp); }
+    }
+    if (bought > 0 && sold > 0) {
+      closedCount++;
+      const week = Math.floor(lastSell / (7 * 86400));
+      weeks.set(week, (weeks.get(week) ?? 0) + (sold - bought));
+    }
+  }
+
+  const weekCount = weeks.size;
+  const positiveWeeks = [...weeks.values()].filter(p => p > 0).length;
+  return {
+    closedCount,
+    weekCount,
+    positiveRatio: weekCount > 0 ? positiveWeeks / weekCount : null,
+  };
+}
+
+export async function verifyWalletLongTerm(walletAddress) {
+  const solPrice = await getSolPrice();
+  const transactions = await getWalletTransactions(
+    walletAddress, VERIFY_WINDOW_DAYS * 24, VERIFY_MAX_PAGES
+  );
+
+  const result = {
+    address: walletAddress,
+    verdict: 'NEUTRE',
+    pnl_long_usd: null,
+    drawdown_equity: null,
+    weeks_positive_ratio: null,
+    closed_positions: 0,
+    covered_days: 0,
+  };
+
+  let trades = transactions
+    .filter(tx => isWalletSwap(tx, walletAddress))
+    .flatMap(tx => extractSwapData(tx, walletAddress));
+  if (!trades.length) return result; // aucune activité visible → NEUTRE
+
+  // Plafond de pages atteint : couverture tronquée, les métriques valent
+  // pour la période réellement couverte (covered_days).
+  const pageCapReached = transactions.length >= VERIFY_MAX_PAGES * 100;
+  result.covered_days =
+    (Date.now() / 1000 - Math.min(...trades.map(t => t.timestamp))) / 86400;
+
+  // Même exigence de reproductibilité que le scoring 48h : un edge long
+  // terme qui vit dans la zone non copiable infirme le wallet.
+  const copyFilter = await filterCopyableTrades(trades);
+  if (copyFilter === null) {
+    result.verdict = 'INFIRME';
+    return result;
+  }
+  trades = copyFilter.trades;
+
+  let pnlSol = 0;
+  for (const pos of groupByToken(trades).values()) pnlSol += pos.sold - pos.bought;
+  result.pnl_long_usd = pnlSol * solPrice;
+  result.drawdown_equity = calculateDrawdown(trades);
+
+  const { closedCount, weekCount, positiveRatio } = weeklyPnlStats(trades);
+  result.closed_positions = closedCount;
+  result.weeks_positive_ratio = positiveRatio;
+
+  // Wallet trop jeune pour être jugé : pas d'historique ≠ mauvais historique.
+  // (Sauf plafond de pages atteint : la couverture courte vient alors d'une
+  // hyperactivité, pas de la jeunesse — on juge sur les données obtenues.)
+  if (closedCount < VERIFY_MIN_CLOSED_POSITIONS ||
+      (!pageCapReached && result.covered_days < VERIFY_MIN_COVERED_DAYS)) {
+    return result; // NEUTRE
+  }
+
+  const infirme =
+    result.pnl_long_usd < 0 ||
+    result.drawdown_equity > VERIFY_MAX_DRAWDOWN_PCT ||
+    (weekCount >= 2 && positiveRatio < VERIFY_MIN_POSITIVE_WEEKS_RATIO);
+
+  result.verdict = infirme ? 'INFIRME' : 'CONFIRME';
+  return result;
 }

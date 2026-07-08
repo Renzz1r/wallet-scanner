@@ -1,19 +1,31 @@
 import 'dotenv/config';
 import { writeFileSync } from 'fs';
 import { startWalletDiscovery } from './discovery.js';
-import { scoreWallets } from './scorer.js';
+import { scoreWallets, verifyWalletLongTerm } from './scorer.js';
 import { filterWallets } from './filter.js';
 import {
   initDatabase,
   getActiveWallets,
+  deactivateAllScores,
   saveWalletScore,
   getTopWallets,
+  getFreshVerifications,
+  saveVerification,
   updateSlot,
+  clearSlotsExcept,
   closeDatabase,
 } from './database.js';
 
 const COLLECT_DURATION_MS = 1 * 60 * 60 * 1000;
 const MIN_APPEARANCES = 20;
+// Étage 4 : 4 slots réservés aux wallets CONFIRMÉS par la vérification longue
+// durée, 1 slot "early" (exposition plafonnée à 1/5 du capital) pour le
+// meilleur NEUTRE — c'est lui qui monétise l'avance sur GMGN.
+const CONFIRMED_SLOTS = 4;
+const EARLY_SLOT_ID = 5;
+// Pool de finalistes vérifiés : assez large pour remplir 4 slots confirmés
+// même si plusieurs finalistes sont infirmés.
+const FINALIST_POOL = 12;
 
 async function processResults() {
   // --- a. récupération des wallets actifs ---
@@ -23,11 +35,10 @@ async function processResults() {
     return;
   }
 
-  const addresses = wallets.map(w => w.address);
-  console.log(`\ngetActiveWallets a retourné ${wallets.length} wallets (seuil ${MIN_APPEARANCES} apparitions sur 48h glissantes) — ${addresses.length} passés au scoring.`);
+  console.log(`\ngetActiveWallets a retourné ${wallets.length} wallets (seuil ${MIN_APPEARANCES} apparitions sur 48h glissantes) — passés au pré-filtre puis au scoring.`);
 
-  // --- d. scoring ---
-  const scored = await scoreWallets(addresses);
+  // --- d. scoring (avec pré-filtre étage 1 : apparitions + signatures) ---
+  const scored = await scoreWallets(wallets);
   if (!scored.length) {
     console.log('Aucun wallet n\'a passé les filtres de scoring.');
     return;
@@ -37,6 +48,9 @@ async function processResults() {
   const boites = filterWallets(scored);
 
   // --- g. sauvegarde en base ---
+  // Les lignes des runs précédents passent inactives ; l'upsert réactive
+  // uniquement les wallets revus dans ce run.
+  await deactivateAllScores();
   for (const [boite, list] of Object.entries(boites)) {
     if (boite === 'EXCLUS') continue;
     for (const wallet of list) {
@@ -70,18 +84,55 @@ async function processResults() {
     }
   }
 
-  // --- k-l. top 5 recommandé + mise à jour des slots ---
-  const top5 = await getTopWallets(5);
-  console.log('=== Recommandation pour les 5 slots actifs ===');
-  if (!top5.length) {
-    console.log('Aucun wallet éligible pour les slots.');
-  } else {
-    for (let i = 0; i < top5.length; i++) {
-      const w = top5[i];
-      await updateSlot(i + 1, w.address, w.score);
-      console.log(`Slot ${i + 1}: ${w.address}  [${w.boite}]  score=${parseFloat(w.score).toFixed(2)}`);
+  // --- k. étage 3 : vérification longue durée des finalistes ---
+  const finalists = await getTopWallets(FINALIST_POOL);
+  const verdicts = await getFreshVerifications(finalists.map(w => w.address));
+
+  if (finalists.length) console.log('\n=== Vérification longue durée (30j) des finalistes ===');
+  for (const w of finalists) {
+    if (verdicts.has(w.address)) {
+      console.log(`${w.address}  ${verdicts.get(w.address)} (verdict en cache)`);
+      continue;
+    }
+    try {
+      const v = await verifyWalletLongTerm(w.address);
+      await saveVerification(v);
+      verdicts.set(w.address, v.verdict);
+      console.log(
+        `${w.address}  ${v.verdict}` +
+        (v.pnl_long_usd !== null
+          ? `  (PnL ${v.pnl_long_usd >= 0 ? '+' : '-'}$${Math.abs(v.pnl_long_usd).toFixed(0)}, ` +
+            `DD ${v.drawdown_equity.toFixed(1)}%, ` +
+            `${v.closed_positions} positions sur ${v.covered_days.toFixed(1)}j)`
+          : `  (couverture ${v.covered_days.toFixed(1)}j)`)
+      );
+    } catch (err) {
+      // Vérification impossible ce run : pas de verdict → pas slotté, sans
+      // blacklister le wallet ni faire tomber le pipeline.
+      console.error(`${w.address}  ÉCHEC vérification : ${err.message}`);
     }
   }
+
+  // --- l. étage 4 : slots classés par score, filtrés par confiance ---
+  const confirmed = finalists
+    .filter(w => verdicts.get(w.address) === 'CONFIRME')
+    .slice(0, CONFIRMED_SLOTS);
+  const bestNeutral = finalists.find(w => verdicts.get(w.address) === 'NEUTRE');
+
+  const assignments = confirmed.map((w, i) => ({ slotId: i + 1, wallet: w, tag: 'CONFIRMÉ' }));
+  if (bestNeutral) {
+    assignments.push({ slotId: EARLY_SLOT_ID, wallet: bestNeutral, tag: 'EARLY·NEUTRE' });
+  }
+
+  console.log(`\n=== Slots : 1-${CONFIRMED_SLOTS} confirmés, ${EARLY_SLOT_ID} early ===`);
+  if (!assignments.length) {
+    console.log('Aucun wallet éligible pour les slots.');
+  }
+  for (const { slotId, wallet, tag } of assignments) {
+    await updateSlot(slotId, wallet.address, wallet.score);
+    console.log(`Slot ${slotId}: ${wallet.address}  [${wallet.boite}|${tag}]  score=${parseFloat(wallet.score).toFixed(2)}`);
+  }
+  await clearSlotsExcept(assignments.map(a => a.slotId));
 }
 
 async function runScanner() {
