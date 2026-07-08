@@ -6,10 +6,12 @@
     "start": "node src/index.js"
   },
   "dependencies": {
+    "@nktkas/hyperliquid": "0.33.1",
     "axios": "^1.6.0",
     "dotenv": "^16.0.0",
     "p-limit": "^5.0.0",
     "pg": "^8.21.0",
+    "viem": "2.54.6",
     "ws": "^8.20.1"
   }
 }
